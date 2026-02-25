@@ -6,9 +6,9 @@
 
 
 [project]
-name = "ayon-addon-template"
+name = "ayon-ubp-nuke-turnover"
 version = "0.1.0"
-description = "Add your description here"
+description = "UBP Edit Turnover tools for standard Nuke."
 license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.9.6"

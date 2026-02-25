@@ -1,10 +1,18 @@
 """Settings for the addon."""
-from typing import Any
+from ayon_server.settings import BaseSettingsModel, MultiplatformPathModel, SettingsField
 
-from ayon_server.settings import BaseSettingsModel
+DEFAULT_VALUES = dict(
+    reels_search_root_folder_path=dict(
+        windows="",
+        darwin="",
+        linux="",
+    ),
+)
 
-DEFAULT_VALUES: dict[str, Any] = {}
 
-
-class MySettings(BaseSettingsModel):
-    """Settings for the addon."""
+class UBPNukeTurnoverSettings(BaseSettingsModel):
+    reels_search_root_folder_path: MultiplatformPathModel = SettingsField(
+        default_factory=MultiplatformPathModel,
+        title="Reels Search Root Folder Path",
+        description="Top level folder under which to search for reels referenced in editorial timelines.",
+    )

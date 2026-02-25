@@ -1,0 +1,6 @@
+[project]
+name="ubp_nuke_turnover"
+description="AYON UBP Nuke Turnover Addon."
+
+[tool.poetry.dependencies]
+pyaaf2 = "1.7.1"
