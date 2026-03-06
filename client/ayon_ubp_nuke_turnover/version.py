@@ -1,3 +1,2 @@
-# -*- coding: utf-8 -*-
-"""Package declaring AYON addon 'nuke' version."""
+"""Package declaring AYON addon 'ubp_nuke_turnover' version."""
 __version__ = "0.1.0"
