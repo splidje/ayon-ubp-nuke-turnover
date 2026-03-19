@@ -1,4 +1,5 @@
 import json
+import os
 import platform
 import re
 
@@ -9,6 +10,7 @@ from urllib.request import urlopen
 
 import opentimelineio as otio
 
+import ayon_api
 import ayon_core
 
 from ayon_core.settings import get_current_project_settings
@@ -57,6 +59,7 @@ def process_plate_timeline(
     plate_number: int,
     timeline: otio.schema.Timeline,
 ) -> None:
+    from ayon_nuke.api.lib import WorkfileSettings
     from qtpy.QtCore import QTimer
 
     import nuke
@@ -72,22 +75,28 @@ def process_plate_timeline(
         )
         raise ValueError(value_error_message)
 
-    # TODO @splidje: create sequence + shot.
-    print(sequence_name, shot_name, plate_number)
-    # Then switch context and refresh frame range
-    # (then no need for below)
-    first_handle_frame_number = 1001
+    settings = get_current_project_settings()["ubp_nuke_turnover"]
+    first_handle_frame_number = settings["first_handle_frame_number"]
+    handle_length = settings["handle_length"]
+
     last_handle_frame_number = round(
         first_handle_frame_number + timeline_duration.value - 1
     )
-    frame_range_string = (
-        f"{first_handle_frame_number + 8}-{last_handle_frame_number - 8}"
+
+    shot_entity_dict = ensure_sequence_and_shot_exist(
+        sequence_name,
+        shot_name,
+        first_handle_frame_number,
+        last_handle_frame_number,
+        handle_length,
     )
-    root_node["lock_range"].setValue(False)
-    root_node["first_frame"].setValue(first_handle_frame_number)
-    root_node["last_frame"].setValue(last_handle_frame_number)
-    root_node["lock_range"].setValue(True)
-    QTimer.singleShot(0, lambda: set_viewer_frame_ranges(frame_range_string))
+    turnover_task_entity_dict = ensure_turnover_task_exists(shot_entity_dict)
+
+    ayon_core.pipeline.context_tools.change_current_context(
+        shot_entity_dict,
+        turnover_task_entity_dict,
+    )
+    WorkfileSettings().set_context_settings()
 
     source_name = get_source_name_from_timeline_clips(timeline)
 
@@ -103,7 +112,7 @@ def process_plate_timeline(
         source_file_path,
         scale,
     ) in get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
-        source_name
+        source_name, settings
     ):
         create_nodes_for_layer(
             f"{plate_name_prefix}{plate_number:02}_{layer_name}",
@@ -113,6 +122,119 @@ def process_plate_timeline(
             scale,
             frame_number_map,
         )
+
+    # HACK: And once for luck!
+    QTimer.singleShot(0, lambda: WorkfileSettings().set_context_settings())
+
+
+def ensure_sequence_and_shot_exist(
+    sequence_name,
+    shot_name,
+    first_handle_frame_number,
+    last_handle_frame_number,
+    handle_length,
+):
+    project_name = os.environ["AYON_PROJECT_NAME"]
+    shot_entity_dicts = tuple(
+        ayon_api.get_folders(
+            project_name,
+            folder_names=[shot_name],
+            folder_types=["Shot"],
+        )
+    )
+    if len(shot_entity_dicts) > 1:
+        raise ValueError(
+            f"More than one Shot exists called {shot_name}: {shot_entity_dicts}"
+        )
+
+    first_frame_number = first_handle_frame_number + handle_length
+    last_frame_number = last_handle_frame_number - handle_length
+
+    if shot_entity_dicts:
+        shot_entity_dict = shot_entity_dicts[0]
+        shot_attributes_dict = shot_entity_dict["attrib"]
+        if (
+            shot_attributes_dict["frameStart"] != first_frame_number
+            or shot_attributes_dict["frameEnd"] != last_frame_number
+            or shot_attributes_dict["handleStart"] != handle_length
+            or shot_attributes_dict["handleEnd"] != handle_length
+        ):
+            raise ValueError(
+                "Existing Shot doesn't have correct"
+                f" frameStart: {first_frame_number}"
+                f", frameEnd: {last_frame_number}"
+                f", handleStart/End: {handle_length}"
+                f": {shot_entity_dict}"
+            )
+
+        return shot_entity_dict
+
+    sequence_entity_dict = ensure_sequence_exists(sequence_name)
+
+    shot_id = ayon_api.create_folder(
+        project_name,
+        name=shot_name,
+        folder_type="Shot",
+        parent_id=sequence_entity_dict["id"],
+        attrib=dict(
+            frameStart=first_frame_number,
+            frameEnd=last_frame_number,
+            handleStart=handle_length,
+            handleEnd=handle_length,
+        ),
+    )
+    return next(ayon_api.get_folders(project_name, folder_ids=[shot_id]))
+
+
+def ensure_sequence_exists(sequence_name):
+    project_name = os.environ["AYON_PROJECT_NAME"]
+    sequence_entity_dicts = tuple(
+        ayon_api.get_folders(
+            project_name,
+            folder_names=[sequence_name],
+            folder_types=["Sequence"],
+        )
+    )
+    if len(sequence_entity_dicts) > 1:
+        raise ValueError(
+            f"More than one Sequence exists called {sequence_name}: {sequence_entity_dicts}"
+        )
+
+    if sequence_entity_dicts:
+        return sequence_entity_dicts[0]
+
+    sequence_id = ayon_api.create_folder(
+        project_name, name=sequence_name, folder_type="Sequence"
+    )
+    return next(ayon_api.get_folders(project_name, folder_ids=[sequence_id]))
+
+
+def ensure_turnover_task_exists(shot_entity_dict):
+    project_name = os.environ["AYON_PROJECT_NAME"]
+    turnover_task_entity_dicts = tuple(
+        ayon_api.get_tasks(
+            project_name,
+            task_names=["TURNOVER"],
+            task_types=["Edit"],
+            folder_ids=[shot_entity_dict["id"]],
+        )
+    )
+    if len(turnover_task_entity_dicts) > 1:
+        raise ValueError(
+            f"More than one Task exists called TURNOVER: {turnover_task_entity_dicts}"
+        )
+
+    if turnover_task_entity_dicts:
+        return turnover_task_entity_dicts[0]
+
+    task_id = ayon_api.create_task(
+        project_name,
+        name="TURNOVER",
+        task_type="Edit",
+        folder_id=shot_entity_dict["id"],
+        label="Turnover",
+    )
+    return next(ayon_api.get_tasks(project_name, task_ids=[task_id]))
 
 
 def set_viewer_frame_ranges(frame_range_string: str) -> None:
@@ -128,6 +250,7 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
 ) -> tuple[otio.opentime.TimeRange, int, dict[int, int]]:
     first_frame_number = None
     source_start_time = None
+    previous_clip_source_end_time_exclusive = None
     previous_clip_timeline_end_time_exclusive = None
     frame_number_map = None
     accumulated_offset = 0
@@ -138,12 +261,9 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                 timeline_first_frame_number + range_in_timeline.start_time.value
             )
             source_start_time = clip.source_range.start_time
+            previous_clip_source_end_time_exclusive = clip.source_range.start_time
             previous_clip_timeline_end_time_exclusive = range_in_timeline.start_time
-        if (
-            previous_clip_timeline_end_time_exclusive is not None
-            and range_in_timeline.start_time
-            != previous_clip_timeline_end_time_exclusive
-        ):
+        if range_in_timeline.start_time != previous_clip_timeline_end_time_exclusive:
             value_error_message = (
                 f"Clip {clip.name} starts:"
                 f" {range_in_timeline.start_time.to_timecode()}"
@@ -152,18 +272,21 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
             )
             raise ValueError(value_error_message)
 
+        source_offset = (
+            clip.source_range.start_time - previous_clip_source_end_time_exclusive
+        ).value
+
         keyframe_values = None
         for effect in clip.effects:
             if not isinstance(effect, otio.schema.TimeEffect):
                 continue
 
             if isinstance(effect, otio.schema.FreezeFrame):
-                keyframe_values = (
-                    (0, 0),
-                    (
-                        range_in_timeline.duration.value - 1,
-                        0,
-                    ),
+                keyframe_values = tuple(
+                    (output_relative_frame_number, source_offset)
+                    for output_relative_frame_number in range(
+                        round(range_in_timeline.duration.value)
+                    )
                 )
                 break
 
@@ -174,8 +297,27 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                 .get("keyframe_values", ())
             )
             if keyframe_values:
+                keyframe_values = tuple(
+                    (
+                        output_relative_frame_number,
+                        input_relative_frame_number + source_offset,
+                    )
+                    for output_relative_frame_number, input_relative_frame_number in keyframe_values
+                )
                 break
 
+        if source_offset and not keyframe_values:
+            keyframe_values = tuple(
+                (
+                    output_relative_frame_number,
+                    output_relative_frame_number + source_offset,
+                )
+                for output_relative_frame_number in range(
+                    round(range_in_timeline.duration.value)
+                )
+            )
+
+        previous_clip_source_end_time_exclusive = clip.source_range.end_time_exclusive()
         if keyframe_values:
             if not frame_number_map:
                 # fill frames so far
@@ -203,6 +345,9 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                     frame_number + accumulated_offset + offset
                 )
             accumulated_offset += offset
+            previous_clip_source_end_time_exclusive += otio.opentime.RationalTime(
+                offset, source_start_time.rate
+            )
         elif frame_number_map:
             frame_number_map.update(
                 {
@@ -273,25 +418,26 @@ def get_source_name_from_timeline_clips(
     return source_name
 
 
-def get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(source_name):
-    still_life_take_version_full_name_regex = get_current_project_settings()[
-        "ubp_nuke_turnover"
-    ]["still_life_take_version_full_name_regex"]
+def get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+    source_name, settings
+):
+    still_life_take_version_full_name_regex = settings[
+        "still_life_take_version_full_name_regex"
+    ]
     match_ = re.search(still_life_take_version_full_name_regex, source_name)
     if match_:
         return get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
-            match_.group(1)
+            match_.group(1), settings
         )
 
     return get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
-        source_name
+        source_name, settings
     )
 
 
 def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
-    take_version_full_name,
+    take_version_full_name, settings
 ) -> Iterable[tuple[str, Path, float]]:
-    settings = get_current_project_settings()["ubp_nuke_turnover"]
     bond_uri = settings["still_life_bond_uri"]
     root_folder_path = Path(
         settings["still_life_root_folder_path"][platform.system().lower()]
@@ -337,12 +483,10 @@ def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruple
 
 
 def get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
-    source_name: str,
+    source_name: str, settings
 ) -> Iterable[tuple[str, Path, float]]:
     reels_search_root_folder_path = Path(
-        get_current_project_settings()["ubp_nuke_turnover"][
-            "reels_search_root_folder_path"
-        ][platform.system().lower()]
+        settings["reels_search_root_folder_path"][platform.system().lower()]
     )
     reel_file_path_string = next(
         reels_search_root_folder_path.glob(f"**/{source_name}.mxf"),
@@ -428,6 +572,9 @@ def create_nodes_for_layer(
         ayon_core.pipeline.registered_host()
     ).create("create_write_plate", variant_name)
     current_node = created_instance.transient_data["node"]
+    current_node["use_limit"].setValue(True)
+    current_node["first"].setValue(first_frame_number)
+    current_node["last"].setValue(first_frame_number + source_range.duration.value - 1)
 
     if frame_number_map:
         current_node = nuke.nodes.TimeWarp(
