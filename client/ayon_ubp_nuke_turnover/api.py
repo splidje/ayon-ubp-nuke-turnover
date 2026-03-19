@@ -261,7 +261,7 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                 timeline_first_frame_number + range_in_timeline.start_time.value
             )
             source_start_time = clip.source_range.start_time
-            previous_clip_source_end_time_exclusive = clip.source_range.start_time
+            previous_clip_source_end_time_exclusive = source_start_time
             previous_clip_timeline_end_time_exclusive = range_in_timeline.start_time
         if range_in_timeline.start_time != previous_clip_timeline_end_time_exclusive:
             value_error_message = (
@@ -346,7 +346,7 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                 )
             accumulated_offset += offset
             previous_clip_source_end_time_exclusive += otio.opentime.RationalTime(
-                offset, source_start_time.rate
+                offset - source_offset, source_start_time.rate
             )
         elif frame_number_map:
             frame_number_map.update(
