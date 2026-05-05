@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Iterable
 from urllib.request import urlopen
 
-import opentimelineio as otio
-
 import ayon_api
 import ayon_core
 
+from ayon_core.lib import Logger
 from ayon_core.settings import get_current_project_settings
+
+log = Logger.get_logger(__name__)
 
 
 def show_timeline_file_chooser(parent) -> None:
@@ -27,6 +28,8 @@ def show_timeline_file_chooser(parent) -> None:
 
 
 def process_timeline_file(timeline_file_path: Path) -> None:
+    import opentimelineio as otio
+
     shot_name_regex_pattern = r"(?P<shot_name>(?P<sequence_name>\d{3}_[A-Z]{2})_\d{4})"
     shot_name_match = re.search(shot_name_regex_pattern, timeline_file_path.stem)
     if not shot_name_match:
@@ -45,10 +48,27 @@ def process_timeline_file(timeline_file_path: Path) -> None:
         )
         raise ValueError(value_error_message)
 
+    settings = get_current_project_settings()["ubp_nuke_turnover"]
+    default_handle_length = settings["default_handle_length"]
+
+    handle_start_match = re.search(r"[_\d]H(\d+)", timeline_file_path.stem)
+    handle_start = (
+        int(handle_start_match.group(1))
+        if handle_start_match
+        else default_handle_length
+    )
+
+    handle_end_match = re.search(r"[_\d]T(\d+)", timeline_file_path.stem)
+    handle_end = (
+        int(handle_end_match.group(1)) if handle_end_match else default_handle_length
+    )
+
     process_plate_timeline(
         shot_name_match.group("sequence_name"),
         shot_name_match.group("shot_name"),
         int(plate_number_match.group(1)),
+        handle_start,
+        handle_end,
         otio.adapters.read_from_file(str(timeline_file_path)),
     )
 
@@ -57,7 +77,9 @@ def process_plate_timeline(
     sequence_name: str,
     shot_name: str,
     plate_number: int,
-    timeline: otio.schema.Timeline,
+    handle_start: int,
+    handle_end: int,
+    timeline: "otio.schema.Timeline",
 ) -> None:
     from ayon_nuke.api.lib import WorkfileSettings
     from qtpy.QtCore import QTimer
@@ -77,7 +99,6 @@ def process_plate_timeline(
 
     settings = get_current_project_settings()["ubp_nuke_turnover"]
     first_handle_frame_number = settings["first_handle_frame_number"]
-    handle_length = settings["handle_length"]
 
     last_handle_frame_number = round(
         first_handle_frame_number + timeline_duration.value - 1
@@ -88,7 +109,8 @@ def process_plate_timeline(
         shot_name,
         first_handle_frame_number,
         last_handle_frame_number,
-        handle_length,
+        handle_start,
+        handle_end,
     )
     turnover_task_entity_dict = ensure_turnover_task_exists(shot_entity_dict)
 
@@ -132,7 +154,8 @@ def ensure_sequence_and_shot_exist(
     shot_name,
     first_handle_frame_number,
     last_handle_frame_number,
-    handle_length,
+    handle_start,
+    handle_end,
 ):
     project_name = os.environ["AYON_PROJECT_NAME"]
     shot_entity_dicts = tuple(
@@ -147,23 +170,24 @@ def ensure_sequence_and_shot_exist(
             f"More than one Shot exists called {shot_name}: {shot_entity_dicts}"
         )
 
-    first_frame_number = first_handle_frame_number + handle_length
-    last_frame_number = last_handle_frame_number - handle_length
+    first_frame_number = first_handle_frame_number + handle_start
+    last_frame_number = last_handle_frame_number - handle_end
 
     if shot_entity_dicts:
         shot_entity_dict = shot_entity_dicts[0]
         shot_attributes_dict = shot_entity_dict["attrib"]
         if (
             shot_attributes_dict["frameStart"] != first_frame_number
-            or shot_attributes_dict["frameEnd"] != last_frame_number
-            or shot_attributes_dict["handleStart"] != handle_length
-            or shot_attributes_dict["handleEnd"] != handle_length
+            or shot_attributes_dict["frameEnd"] < last_frame_number
+            or shot_attributes_dict["handleStart"] != handle_start
+            or shot_attributes_dict["handleEnd"] != handle_end
         ):
             raise ValueError(
                 "Existing Shot doesn't have correct"
                 f" frameStart: {first_frame_number}"
                 f", frameEnd: {last_frame_number}"
-                f", handleStart/End: {handle_length}"
+                f", handleStart: {handle_start}"
+                f", handleEnd: {handle_end}"
                 f": {shot_entity_dict}"
             )
 
@@ -179,8 +203,8 @@ def ensure_sequence_and_shot_exist(
         attrib=dict(
             frameStart=first_frame_number,
             frameEnd=last_frame_number,
-            handleStart=handle_length,
-            handleEnd=handle_length,
+            handleStart=handle_start,
+            handleEnd=handle_end,
         ),
     )
     return next(ayon_api.get_folders(project_name, folder_ids=[shot_id]))
@@ -246,16 +270,34 @@ def set_viewer_frame_ranges(frame_range_string: str) -> None:
 
 
 def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips(
-    timeline: otio.schema.Timeline, timeline_first_frame_number: int
-) -> tuple[otio.opentime.TimeRange, int, dict[int, int]]:
+    timeline: "otio.schema.Timeline", timeline_first_frame_number: int
+) -> tuple["otio.opentime.TimeRange", int, dict[int, int]]:
+    import opentimelineio as otio
+
     first_frame_number = None
     source_start_time = None
     previous_clip_source_end_time_exclusive = None
     previous_clip_timeline_end_time_exclusive = None
     frame_number_map = None
     accumulated_offset = 0
-    for clip in timeline.clip_if():
-        range_in_timeline = timeline.range_of_child(clip)
+    for clip in timeline.find_clips():
+        time_effect = None
+        item = clip
+        while item:
+            time_effect = next(
+                filter(
+                    lambda effect: isinstance(effect, otio.schema.TimeEffect),
+                    item.effects,
+                ),
+                None,
+            )
+            if time_effect:
+                break
+
+            item = item.parent()
+        item_in_timeline_time = item or clip
+
+        range_in_timeline = timeline.range_of_child(item_in_timeline_time)
         if first_frame_number is None:
             first_frame_number = (
                 timeline_first_frame_number + range_in_timeline.start_time.value
@@ -263,48 +305,86 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
             source_start_time = clip.source_range.start_time
             previous_clip_source_end_time_exclusive = source_start_time
             previous_clip_timeline_end_time_exclusive = range_in_timeline.start_time
-        if range_in_timeline.start_time != previous_clip_timeline_end_time_exclusive:
-            value_error_message = (
-                f"Clip {clip.name} starts:"
+        if range_in_timeline.start_time < previous_clip_timeline_end_time_exclusive:
+            # must be simultaneous clips, which we've seen
+            # happen when the edit has stacked the identical clips
+            # to use different effects on them and comp them together.
+            # so we'll just happily ignore all but one in the stack,
+            # and assume there's no ambiguity (can be picked up by
+            # eye when comparing to edit ref and can come back to it
+            # if it's something that needs validating)
+            log.info(
+                f"Skipping Clip {clip.name}. starts:"
                 f" {range_in_timeline.start_time.to_timecode()}"
-                " which isn't immediately following the previous clip:"
+                " which is before the end of the previous clip:"
                 f" {previous_clip_timeline_end_time_exclusive.to_timecode()}"
             )
-            raise ValueError(value_error_message)
+            continue
+
+        if range_in_timeline.start_time > previous_clip_timeline_end_time_exclusive:
+            if not frame_number_map:
+                # fill frames so far
+                frame_number_map = {
+                    frame_number: frame_number
+                    for frame_number in range(
+                        timeline_first_frame_number,
+                        round(
+                            timeline_first_frame_number
+                            + range_in_timeline.start_time.value
+                        ),
+                    )
+                }
+            frame_number_map.update(
+                {
+                    frame_number: timeline_first_frame_number
+                    + previous_clip_timeline_end_time_exclusive.value
+                    - 1
+                    + accumulated_offset
+                    for frame_number in range(
+                        round(
+                            timeline_first_frame_number
+                            + previous_clip_timeline_end_time_exclusive.value
+                        ),
+                        round(
+                            timeline_first_frame_number
+                            + range_in_timeline.start_time.value
+                        ),
+                    )
+                }
+            )
+            accumulated_offset -= (
+                range_in_timeline.start_time - previous_clip_timeline_end_time_exclusive
+            ).value
+            previous_clip_timeline_end_time_exclusive = range_in_timeline.start_time
 
         source_offset = (
             clip.source_range.start_time - previous_clip_source_end_time_exclusive
         ).value
 
         keyframe_values = None
-        for effect in clip.effects:
-            if not isinstance(effect, otio.schema.TimeEffect):
-                continue
-
-            if isinstance(effect, otio.schema.FreezeFrame):
+        if time_effect:
+            if isinstance(time_effect, otio.schema.FreezeFrame):
                 keyframe_values = tuple(
                     (output_relative_frame_number, source_offset)
                     for output_relative_frame_number in range(
                         round(range_in_timeline.duration.value)
                     )
                 )
-                break
-
-            keyframe_values = (
-                effect.metadata.get("AAF", {})
-                .get("Parameters", {})
-                .get("PARAM_SPEED_OFFSET_MAP_U", {})
-                .get("keyframe_values", ())
-            )
-            if keyframe_values:
-                keyframe_values = tuple(
-                    (
-                        output_relative_frame_number,
-                        input_relative_frame_number + source_offset,
-                    )
-                    for output_relative_frame_number, input_relative_frame_number in keyframe_values
+            else:
+                keyframe_values = (
+                    time_effect.metadata.get("AAF", {})
+                    .get("Parameters", {})
+                    .get("PARAM_SPEED_OFFSET_MAP_U", {})
+                    .get("keyframe_values", ())
                 )
-                break
+                if keyframe_values:
+                    keyframe_values = tuple(
+                        (
+                            output_relative_frame_number,
+                            input_relative_frame_number + source_offset,
+                        )
+                        for output_relative_frame_number, input_relative_frame_number in keyframe_values
+                    )
 
         if source_offset and not keyframe_values:
             keyframe_values = tuple(
@@ -317,7 +397,9 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                 )
             )
 
-        previous_clip_source_end_time_exclusive = clip.source_range.end_time_exclusive()
+        previous_clip_source_end_time_exclusive = (
+            clip.source_range.start_time + range_in_timeline.duration
+        )
         if keyframe_values:
             if not frame_number_map:
                 # fill frames so far
@@ -331,10 +413,14 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                         ),
                     )
                 }
+            max_input_relative_frame_number = 0
             for (
                 output_relative_frame_number,
                 input_relative_frame_number,
             ) in keyframe_values:
+                max_input_relative_frame_number = max(
+                    max_input_relative_frame_number, input_relative_frame_number
+                )
                 frame_number = (
                     timeline_first_frame_number
                     + previous_clip_timeline_end_time_exclusive.value
@@ -344,9 +430,10 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
                 frame_number_map[frame_number] = (
                     frame_number + accumulated_offset + offset
                 )
-            accumulated_offset += offset
+            max_offset = max_input_relative_frame_number - output_relative_frame_number
+            accumulated_offset += max_offset
             previous_clip_source_end_time_exclusive += otio.opentime.RationalTime(
-                offset - source_offset, source_start_time.rate
+                max_offset - source_offset, source_start_time.rate
             )
         elif frame_number_map:
             frame_number_map.update(
@@ -369,11 +456,16 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
             range_in_timeline.end_time_exclusive()
         )
 
+    print(
+        range_in_timeline.end_time_exclusive().value,
+        first_frame_number,
+        timeline_first_frame_number,
+        accumulated_offset,
+    )
     return (
-        otio.opentime.TimeRange.range_from_start_end_time(
+        otio.opentime.TimeRange(
             source_start_time,
-            source_start_time
-            + otio.opentime.RationalTime(
+            otio.opentime.RationalTime(
                 (
                     range_in_timeline.end_time_exclusive().value
                     - (first_frame_number - timeline_first_frame_number)
@@ -388,10 +480,10 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
 
 
 def get_source_name_from_timeline_clips(
-    timeline: otio.schema.Timeline,
+    timeline: "otio.schema.Timeline",
 ) -> Path:
     source_name = None
-    for clip in timeline.clip_if():
+    for clip in timeline.find_clips():
         clip_source_name = clip.metadata.get("cmx_3600", {}).get("reel") or next(
             iter(clip.media_references().keys())
         )
@@ -399,7 +491,11 @@ def get_source_name_from_timeline_clips(
             clip_source_name = re.sub(
                 r"-[^-]+$",
                 "",
-                Path(clip.media_references()[clip_source_name]["target_url"]).stem,
+                Path(
+                    clip.media_references()[clip_source_name].metadata["AAF"][
+                        "UserComments"
+                    ]["Filepath"]
+                ).stem,
             )
         if source_name and source_name != clip_source_name:
             value_error_message = (
@@ -510,6 +606,8 @@ def create_nodes_for_layer(
     scale,
     frame_number_map,
 ):
+    import opentimelineio as otio
+
     import nuke
 
     read_node = nuke.nodes.Read(

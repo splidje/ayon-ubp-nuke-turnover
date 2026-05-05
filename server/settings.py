@@ -20,9 +20,9 @@ class UBPNukeTurnoverSettings(BaseSettingsModel):
         1001,
         title="First Frame Number (Handle)",
     )
-    handle_length: int = SettingsField(
+    default_handle_length: int = SettingsField(
         8,
-        title="Handle Length (Both Start and End)",
+        title="Default Handle Length (Both Start and End)",
     )
     reels_search_root_folder_path: MultiplatformPathModel = SettingsField(
         default_factory=MultiplatformPathModel,
@@ -58,7 +58,7 @@ class UBPNukeTurnoverSettings(BaseSettingsModel):
 
 DEFAULT_VALUES = dict(
     first_frame_number=1001,
-    handle_length=8,
+    default_handle_length=8,
     reels_search_root_folder_path=dict(
         windows="",
         darwin="",

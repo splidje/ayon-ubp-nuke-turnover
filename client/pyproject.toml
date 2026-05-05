@@ -3,4 +3,7 @@ name="ubp_nuke_turnover"
 description="AYON UBP Nuke Turnover Addon."
 
 [tool.poetry.dependencies]
-pyaaf2 = "1.7.1"
+opentimelineio = ">=0.16"
+otio-aaf-adapter = ">=1.0"
+otio_burnins_adapter = ">=1.0"
+Pillow = ">=9.5"
