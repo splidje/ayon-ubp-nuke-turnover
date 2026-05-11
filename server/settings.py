@@ -24,6 +24,10 @@ class UBPNukeTurnoverSettings(BaseSettingsModel):
         8,
         title="Default Handle Length (Both Start and End)",
     )
+    timelines_root_folder_path: MultiplatformPathModel = SettingsField(
+        default_factory=MultiplatformPathModel,
+        title="Timelines Root Folder Path",
+    )
     reels_search_root_folder_path: MultiplatformPathModel = SettingsField(
         default_factory=MultiplatformPathModel,
         title="Reels Search Root Folder Path",
@@ -59,6 +63,11 @@ class UBPNukeTurnoverSettings(BaseSettingsModel):
 DEFAULT_VALUES = dict(
     first_frame_number=1001,
     default_handle_length=8,
+    timelines_root_folder_path=dict(
+        windows="",
+        darwin="",
+        linux="",
+    ),
     reels_search_root_folder_path=dict(
         windows="",
         darwin="",

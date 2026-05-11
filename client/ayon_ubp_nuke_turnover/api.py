@@ -20,7 +20,11 @@ log = Logger.get_logger(__name__)
 def show_timeline_file_chooser(parent) -> None:
     from qtpy.QtWidgets import QFileDialog
 
-    timeline_file_path, _ = QFileDialog.getOpenFileName(parent)
+    settings = get_current_project_settings()["ubp_nuke_turnover"]
+
+    timeline_file_path, _ = QFileDialog.getOpenFileName(
+        parent, dir=settings["timelines_root_folder_path"][platform.system().lower()]
+    )
     if not timeline_file_path:
         return
 
