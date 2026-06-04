@@ -124,7 +124,7 @@ def process_plate_timeline(
     )
     WorkfileSettings().set_context_settings()
 
-    source_name = get_source_name_from_timeline_clips(timeline)
+    source_name = get_source_name_from_timeline_clips(timeline, settings)
 
     source_range, first_frame_number, frame_number_map = (
         get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips(
@@ -484,8 +484,11 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
 
 
 def get_source_name_from_timeline_clips(
-    timeline: "otio.schema.Timeline",
+    timeline: "otio.schema.Timeline", settings: dict
 ) -> Path:
+    still_life_take_version_full_name_regex = settings[
+        "still_life_take_version_full_name_regex"
+    ]
     source_name = None
     for clip in timeline.find_clips():
         clip_source_name = clip.metadata.get("cmx_3600", {}).get("reel") or next(
@@ -501,6 +504,9 @@ def get_source_name_from_timeline_clips(
                     ]["Filepath"]
                 ).stem,
             )
+        match_ = re.search(still_life_take_version_full_name_regex, clip_source_name)
+        if match_:
+            clip_source_name = match_.group(1)
         if source_name and source_name != clip_source_name:
             value_error_message = (
                 "All clips must reference the same reel."
