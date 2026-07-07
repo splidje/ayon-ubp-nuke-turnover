@@ -718,6 +718,9 @@ def create_nodes_for_layer(
         tail_offset = (
             max(plate_last_frame, ensure_source_frame_range[1]) - plate_last_frame
         )
+    else:
+        head_offset = 0
+        tail_offset = 0
     read_node["first"].setValue(plate_first_frame - head_offset)
     read_node["last"].setValue(plate_last_frame + tail_offset)
     current_node = nuke.nodes.TimeOffset(
