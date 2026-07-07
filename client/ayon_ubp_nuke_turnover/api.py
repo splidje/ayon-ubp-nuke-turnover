@@ -1,3 +1,4 @@
+import glob
 import json
 import os
 import platform
@@ -7,6 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 from urllib.request import urlopen
+
+import clique
 
 import ayon_api
 import ayon_core
@@ -28,11 +31,67 @@ def show_timeline_file_chooser(parent) -> None:
     if not timeline_file_path:
         return
 
-    process_timeline_file(Path(timeline_file_path))
+    process_timeline_file(Path(timeline_file_path), settings)
 
 
-def process_timeline_file(timeline_file_path: Path) -> None:
+def show_still_life_take_version_chooser(parent) -> None:
     import opentimelineio as otio
+
+    from qtpy.QtWidgets import QInputDialog
+
+    take_version_full_name, ok = QInputDialog.getText(
+        parent, "Select Still Life Take Version", "Take Version Full Name:"
+    )
+    if not ok or not take_version_full_name:
+        return
+
+    plate_number, ok = QInputDialog.getInt(
+        parent, "Select Plate Number", "Plate Number:", 1, 1, 99, 1
+    )
+    if not ok:
+        return
+
+    settings = get_current_project_settings()["ubp_nuke_turnover"]
+
+    _, _, hashed_path, _, _ = next(
+        get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+            take_version_full_name, settings
+        ),
+        None,
+    )
+    collections, _ = clique.assemble(
+        glob.glob(re.sub(r"#+(.*)\s+\d+-\d+$", r"*\1", str(hashed_path)))
+    )
+    collection = collections[0]
+    first_frame_number, last_frame_number = min(collection.indexes), max(
+        collection.indexes
+    )
+
+    timeline = otio.schema.Timeline(name=take_version_full_name)
+    track = otio.schema.Track(name="Video Track", kind=otio.schema.TrackKind.Video)
+    timeline.tracks.append(track)
+    clip = otio.schema.Clip(
+        name=f"{take_version_full_name}",
+        media_reference=otio.schema.ExternalReference(
+            target_url=take_version_full_name,
+        ),
+        source_range=otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(first_frame_number + 6, 24),
+            duration=otio.opentime.RationalTime(
+                last_frame_number - first_frame_number - 6 + 1, 24
+            ),
+        ),
+    )
+    track.append(clip)
+
+    process_plate_timeline(plate_number, timeline, settings)
+
+
+def process_timeline_file(timeline_file_path: Path, settings: dict) -> None:
+    import opentimelineio as otio
+
+    from ayon_nuke.api.lib import WorkfileSettings
+    from qtpy.QtCore import QTimer
 
     shot_name_regex_pattern = r"(?P<shot_name>(?P<sequence_name>\d{3}_[A-Z]{2})_\d{4})"
     shot_name_match = re.search(shot_name_regex_pattern, timeline_file_path.stem)
@@ -52,7 +111,6 @@ def process_timeline_file(timeline_file_path: Path) -> None:
         )
         raise ValueError(value_error_message)
 
-    settings = get_current_project_settings()["ubp_nuke_turnover"]
     default_handle_length = settings["default_handle_length"]
 
     handle_start_match = re.search(r"[_\d]H(\d+)", timeline_file_path.stem)
@@ -67,27 +125,45 @@ def process_timeline_file(timeline_file_path: Path) -> None:
         int(handle_end_match.group(1)) if handle_end_match else default_handle_length
     )
 
-    process_plate_timeline(
+    timeline = otio.adapters.read_from_file(str(timeline_file_path))
+
+    first_handle_frame_number = settings["first_handle_frame_number"]
+
+    last_handle_frame_number = round(
+        first_handle_frame_number + timeline.duration().value - 1
+    )
+
+    shot_entity_dict = ensure_sequence_and_shot_exist(
         shot_name_match.group("sequence_name"),
         shot_name_match.group("shot_name"),
-        int(plate_number_match.group(1)),
+        first_handle_frame_number,
+        last_handle_frame_number,
         handle_start,
         handle_end,
-        otio.adapters.read_from_file(str(timeline_file_path)),
+    )
+    turnover_task_entity_dict = ensure_turnover_task_exists(shot_entity_dict)
+
+    ayon_core.pipeline.context_tools.change_current_context(
+        shot_entity_dict,
+        turnover_task_entity_dict,
+    )
+    WorkfileSettings().set_context_settings()
+
+    # HACK: And once for luck!
+    QTimer.singleShot(0, lambda: WorkfileSettings().set_context_settings())
+
+    process_plate_timeline(
+        int(plate_number_match.group(1)),
+        timeline,
+        settings,
     )
 
 
 def process_plate_timeline(
-    sequence_name: str,
-    shot_name: str,
     plate_number: int,
-    handle_start: int,
-    handle_end: int,
     timeline: "otio.schema.Timeline",
+    settings: dict,
 ) -> None:
-    from ayon_nuke.api.lib import WorkfileSettings
-    from qtpy.QtCore import QTimer
-
     import nuke
 
     root_node = nuke.root()
@@ -101,28 +177,7 @@ def process_plate_timeline(
         )
         raise ValueError(value_error_message)
 
-    settings = get_current_project_settings()["ubp_nuke_turnover"]
     first_handle_frame_number = settings["first_handle_frame_number"]
-
-    last_handle_frame_number = round(
-        first_handle_frame_number + timeline_duration.value - 1
-    )
-
-    shot_entity_dict = ensure_sequence_and_shot_exist(
-        sequence_name,
-        shot_name,
-        first_handle_frame_number,
-        last_handle_frame_number,
-        handle_start,
-        handle_end,
-    )
-    turnover_task_entity_dict = ensure_turnover_task_exists(shot_entity_dict)
-
-    ayon_core.pipeline.context_tools.change_current_context(
-        shot_entity_dict,
-        turnover_task_entity_dict,
-    )
-    WorkfileSettings().set_context_settings()
 
     source_name = get_source_name_from_timeline_clips(timeline, settings)
 
@@ -137,6 +192,7 @@ def process_plate_timeline(
         layer_name,
         source_file_path,
         scale,
+        ensure_source_frame_range,
     ) in get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
         source_name, settings
     ):
@@ -144,13 +200,11 @@ def process_plate_timeline(
             f"{plate_name_prefix}{plate_number:02}_{layer_name}",
             source_file_path,
             source_range,
+            ensure_source_frame_range,
             first_frame_number,
             scale,
             frame_number_map,
         )
-
-    # HACK: And once for luck!
-    QTimer.singleShot(0, lambda: WorkfileSettings().set_context_settings())
 
 
 def ensure_sequence_and_shot_exist(
@@ -495,13 +549,13 @@ def get_source_name_from_timeline_clips(
             iter(clip.media_references().keys())
         )
         if clip_source_name == "DEFAULT_MEDIA":
+            media_reference = clip.media_references()[clip_source_name]
             clip_source_name = re.sub(
                 r"-[^-]+$",
                 "",
                 Path(
-                    clip.media_references()[clip_source_name].metadata["AAF"][
-                        "UserComments"
-                    ]["Filepath"]
+                    media_reference.target_url
+                    or media_reference.metadata["AAF"]["UserComments"]["Filepath"]
                 ).stem,
             )
         match_ = re.search(still_life_take_version_full_name_regex, clip_source_name)
@@ -543,7 +597,7 @@ def get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
 
 def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
     take_version_full_name, settings
-) -> Iterable[tuple[str, Path, float]]:
+) -> Iterable[tuple[str, str, Path, float, tuple | None]]:
     bond_uri = settings["still_life_bond_uri"]
     root_folder_path = Path(
         settings["still_life_root_folder_path"][platform.system().lower()]
@@ -585,12 +639,12 @@ def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruple
         number = len(layer_name_by_layer_type[layer_type]) + 1
         layer_name = f"{layer_type}{number:02d}"
         layer_name_by_layer_type[layer_type].append(layer_name)
-        yield "SM", layer_name, root_folder_path / frame_hashed_relative_path, 1
+        yield "SM", layer_name, root_folder_path / frame_hashed_relative_path, 1, (1, 6)
 
 
 def get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
     source_name: str, settings
-) -> Iterable[tuple[str, Path, float]]:
+) -> Iterable[tuple[str, Path, float, tuple | None]]:
     reels_search_root_folder_path = Path(
         settings["reels_search_root_folder_path"][platform.system().lower()]
     )
@@ -605,13 +659,14 @@ def get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
         )
         raise FileNotFoundError(file_not_found_message)
 
-    return (("LA", "BTY01", Path(reel_file_path_string), 0.5),)
+    return (("LA", "BTY01", Path(reel_file_path_string), 0.5, None),)
 
 
 def create_nodes_for_layer(
     variant_name,
     source_file_path,
     source_range,
+    ensure_source_frame_range: tuple | None,
     first_frame_number,
     scale,
     frame_number_map,
@@ -656,14 +711,21 @@ def create_nodes_for_layer(
     plate_last_frame = (
         round((source_range.end_time_inclusive() - source_start_time).value) + 1
     )
-    read_node["first"].setValue(plate_first_frame)
-    read_node["last"].setValue(plate_last_frame)
+    if ensure_source_frame_range:
+        head_offset = plate_first_frame - min(
+            plate_first_frame, ensure_source_frame_range[0]
+        )
+        tail_offset = (
+            max(plate_last_frame, ensure_source_frame_range[1]) - plate_last_frame
+        )
+    read_node["first"].setValue(plate_first_frame - head_offset)
+    read_node["last"].setValue(plate_last_frame + tail_offset)
     current_node = nuke.nodes.TimeOffset(
         inputs=(
             nuke.nodes.FrameRange(
                 inputs=(read_node,),
-                first_frame=plate_first_frame,
-                last_frame=plate_last_frame,
+                first_frame=plate_first_frame - head_offset,
+                last_frame=plate_last_frame + tail_offset,
             ),
         ),
         time_offset=first_frame_number - plate_first_frame,
@@ -681,8 +743,10 @@ def create_nodes_for_layer(
     ).create("create_write_plate", variant_name)
     current_node = created_instance.transient_data["node"]
     current_node["use_limit"].setValue(True)
-    current_node["first"].setValue(first_frame_number)
-    current_node["last"].setValue(first_frame_number + source_range.duration.value - 1)
+    current_node["first"].setValue(first_frame_number - head_offset)
+    current_node["last"].setValue(
+        first_frame_number + source_range.duration.value - 1 + tail_offset
+    )
 
     if frame_number_map:
         current_node = nuke.nodes.TimeWarp(

@@ -5,7 +5,7 @@ from typing import Any
 
 from ayon_core.addon import AYONAddon
 
-from .api import show_timeline_file_chooser
+from .api import show_timeline_file_chooser, show_still_life_take_version_chooser
 from .version import __version__
 
 _MENU_LABEL = "UBP Turnover"
@@ -45,4 +45,7 @@ class UBPNukeTurnoverAddon(AYONAddon):
         menu = menubar.addMenu(_MENU_LABEL)
         menu.addCommand(
             "Read Timeline File...", lambda: show_timeline_file_chooser(main_window)
+        )
+        menu.addCommand(
+            "Select Still Life Take Version...", lambda: show_still_life_take_version_chooser(main_window)
         )
