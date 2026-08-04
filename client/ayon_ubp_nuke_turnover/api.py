@@ -31,7 +31,46 @@ def show_timeline_file_chooser(parent) -> None:
     if not timeline_file_path:
         return
 
-    process_timeline_file(Path(timeline_file_path), settings)
+    _process_timeline_file(Path(timeline_file_path), settings)
+
+
+def show_reel_chooser(parent) -> None:
+    import opentimelineio as otio
+
+    from qtpy.QtWidgets import QInputDialog
+
+    reel_name, ok = QInputDialog.getText(parent, "Select Reel", "Reel Name:")
+    if not ok or not reel_name:
+        return
+
+    settings = get_current_project_settings()["ubp_nuke_turnover"]
+
+    plate_code = _try_ask_for_plate_code(parent)
+    if not plate_code:
+        return
+
+    start_timecode, ok = QInputDialog.getText(
+        parent, "Choose Start Timecode", "Start Timecode:"
+    )
+    if not ok or not start_timecode:
+        return
+
+    end_timecode, ok = QInputDialog.getText(
+        parent, "Choose End Timecode", "End Timecode:"
+    )
+    if not ok or not end_timecode:
+        return
+
+    _process_plate_timeline(
+        plate_code,
+        _generate_timeline(
+            reel_name,
+            otio.opentime.RationalTime.from_timecode(start_timecode, 24).value,
+            otio.opentime.RationalTime.from_timecode(end_timecode, 24).value,
+        ),
+        1,
+        settings,
+    )
 
 
 def show_still_life_take_version_chooser(parent) -> None:
@@ -45,16 +84,18 @@ def show_still_life_take_version_chooser(parent) -> None:
     if not ok or not take_version_full_name:
         return
 
-    plate_number, ok = QInputDialog.getInt(
-        parent, "Select Plate Number", "Plate Number:", 1, 1, 99, 1
-    )
-    if not ok:
-        return
-
     settings = get_current_project_settings()["ubp_nuke_turnover"]
 
+    take_version_full_name = _try_clean_take_version_full_name(
+        take_version_full_name, settings
+    )
+
+    plate_code = _try_ask_for_plate_code(parent)
+    if not plate_code:
+        return
+
     _, _, hashed_path, _, _ = next(
-        get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+        _get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
             take_version_full_name, settings
         ),
         None,
@@ -67,27 +108,62 @@ def show_still_life_take_version_chooser(parent) -> None:
         collection.indexes
     )
 
-    timeline = otio.schema.Timeline(name=take_version_full_name)
+    _process_plate_timeline(
+        plate_code,
+        _generate_timeline(
+            take_version_full_name, first_frame_number, last_frame_number
+        ),
+        first_frame_number,
+        settings,
+    )
+
+
+def _try_ask_for_plate_code(parent) -> str | None:
+    from qtpy.QtWidgets import QInputDialog
+
+    plate_code, ok = QInputDialog.getText(
+        parent,
+        "Select Plate Number/Code",
+        "Plate Number/Code (2 characters):",
+        text="E1",
+    )
+    if not ok or not plate_code:
+        return None
+
+    if len(plate_code) == 1 and plate_code.isnumeric():
+        plate_code = f"0{plate_code}"
+
+    plate_code_regex = r"[A-Z\d]{2}$"
+    if not re.match(plate_code_regex, plate_code):
+        raise ValueError(f"{plate_code} doesn't match pattern {plate_code_regex}")
+
+    return plate_code
+
+
+def _generate_timeline(source_clip_name, first_frame_number, last_frame_number):
+    import opentimelineio as otio
+
+    timeline = otio.schema.Timeline(name=source_clip_name)
     track = otio.schema.Track(name="Video Track", kind=otio.schema.TrackKind.Video)
     timeline.tracks.append(track)
     clip = otio.schema.Clip(
-        name=f"{take_version_full_name}",
+        name=source_clip_name,
         media_reference=otio.schema.ExternalReference(
-            target_url=take_version_full_name,
+            target_url=source_clip_name,
         ),
         source_range=otio.opentime.TimeRange(
-            start_time=otio.opentime.RationalTime(first_frame_number + 6, 24),
+            start_time=otio.opentime.RationalTime(first_frame_number, 24),
             duration=otio.opentime.RationalTime(
-                last_frame_number - first_frame_number - 6 + 1, 24
+                last_frame_number - first_frame_number + 1, 24
             ),
         ),
     )
     track.append(clip)
 
-    process_plate_timeline(plate_number, timeline, settings)
+    return timeline
 
 
-def process_timeline_file(timeline_file_path: Path, settings: dict) -> None:
+def _process_timeline_file(timeline_file_path: Path, settings: dict) -> None:
     import opentimelineio as otio
 
     from ayon_nuke.api.lib import WorkfileSettings
@@ -133,7 +209,7 @@ def process_timeline_file(timeline_file_path: Path, settings: dict) -> None:
         first_handle_frame_number + timeline.duration().value - 1
     )
 
-    shot_entity_dict = ensure_sequence_and_shot_exist(
+    shot_entity_dict = _ensure_sequence_and_shot_exist(
         shot_name_match.group("sequence_name"),
         shot_name_match.group("shot_name"),
         first_handle_frame_number,
@@ -141,7 +217,7 @@ def process_timeline_file(timeline_file_path: Path, settings: dict) -> None:
         handle_start,
         handle_end,
     )
-    turnover_task_entity_dict = ensure_turnover_task_exists(shot_entity_dict)
+    turnover_task_entity_dict = _ensure_turnover_task_exists(shot_entity_dict)
 
     ayon_core.pipeline.context_tools.change_current_context(
         shot_entity_dict,
@@ -152,16 +228,18 @@ def process_timeline_file(timeline_file_path: Path, settings: dict) -> None:
     # HACK: And once for luck!
     QTimer.singleShot(0, lambda: WorkfileSettings().set_context_settings())
 
-    process_plate_timeline(
-        int(plate_number_match.group(1)),
+    _process_plate_timeline(
+        f"{int(plate_number_match.group(1)):02}",
         timeline,
+        settings["first_handle_frame_number"],
         settings,
     )
 
 
-def process_plate_timeline(
-    plate_number: int,
+def _process_plate_timeline(
+    plate_code: str,
     timeline: "otio.schema.Timeline",
+    first_handle_frame_number: int,
     settings: dict,
 ) -> None:
     import nuke
@@ -177,12 +255,10 @@ def process_plate_timeline(
         )
         raise ValueError(value_error_message)
 
-    first_handle_frame_number = settings["first_handle_frame_number"]
-
-    source_name = get_source_name_from_timeline_clips(timeline, settings)
+    source_name = _get_source_name_from_timeline_clips(timeline, settings)
 
     source_range, first_frame_number, frame_number_map = (
-        get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips(
+        _get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips(
             timeline, first_handle_frame_number
         )
     )
@@ -193,11 +269,11 @@ def process_plate_timeline(
         source_file_path,
         scale,
         ensure_source_frame_range,
-    ) in get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+    ) in _get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
         source_name, settings
     ):
-        create_nodes_for_layer(
-            f"{plate_name_prefix}{plate_number:02}_{layer_name}",
+        _create_nodes_for_layer(
+            f"{plate_name_prefix}{plate_code}_{layer_name}",
             source_file_path,
             source_range,
             ensure_source_frame_range,
@@ -207,7 +283,7 @@ def process_plate_timeline(
         )
 
 
-def ensure_sequence_and_shot_exist(
+def _ensure_sequence_and_shot_exist(
     sequence_name,
     shot_name,
     first_handle_frame_number,
@@ -251,7 +327,7 @@ def ensure_sequence_and_shot_exist(
 
         return shot_entity_dict
 
-    sequence_entity_dict = ensure_sequence_exists(sequence_name)
+    sequence_entity_dict = _ensure_sequence_exists(sequence_name)
 
     shot_id = ayon_api.create_folder(
         project_name,
@@ -268,7 +344,7 @@ def ensure_sequence_and_shot_exist(
     return next(ayon_api.get_folders(project_name, folder_ids=[shot_id]))
 
 
-def ensure_sequence_exists(sequence_name):
+def _ensure_sequence_exists(sequence_name):
     project_name = os.environ["AYON_PROJECT_NAME"]
     sequence_entity_dicts = tuple(
         ayon_api.get_folders(
@@ -291,7 +367,7 @@ def ensure_sequence_exists(sequence_name):
     return next(ayon_api.get_folders(project_name, folder_ids=[sequence_id]))
 
 
-def ensure_turnover_task_exists(shot_entity_dict):
+def _ensure_turnover_task_exists(shot_entity_dict):
     project_name = os.environ["AYON_PROJECT_NAME"]
     turnover_task_entity_dicts = tuple(
         ayon_api.get_tasks(
@@ -319,15 +395,7 @@ def ensure_turnover_task_exists(shot_entity_dict):
     return next(ayon_api.get_tasks(project_name, task_ids=[task_id]))
 
 
-def set_viewer_frame_ranges(frame_range_string: str) -> None:
-    import nuke
-
-    for viewer_node in nuke.allNodes(filter="Viewer"):
-        viewer_node["frame_range"].setValue(frame_range_string)
-        viewer_node["frame_range_lock"].setValue(True)
-
-
-def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips(
+def _get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips(
     timeline: "otio.schema.Timeline", timeline_first_frame_number: int
 ) -> tuple["otio.opentime.TimeRange", int, dict[int, int]]:
     import opentimelineio as otio
@@ -537,12 +605,9 @@ def get_source_range_first_frame_number_and_frame_number_map_from_timeline_clips
     )
 
 
-def get_source_name_from_timeline_clips(
+def _get_source_name_from_timeline_clips(
     timeline: "otio.schema.Timeline", settings: dict
 ) -> Path:
-    still_life_take_version_full_name_regex = settings[
-        "still_life_take_version_full_name_regex"
-    ]
     source_name = None
     for clip in timeline.find_clips():
         clip_source_name = clip.metadata.get("cmx_3600", {}).get("reel") or next(
@@ -558,9 +623,7 @@ def get_source_name_from_timeline_clips(
                     or media_reference.metadata["AAF"]["UserComments"]["Filepath"]
                 ).stem,
             )
-        match_ = re.search(still_life_take_version_full_name_regex, clip_source_name)
-        if match_:
-            clip_source_name = match_.group(1)
+        clip_source_name = _try_clean_take_version_full_name(clip_source_name, settings)
         if source_name and source_name != clip_source_name:
             value_error_message = (
                 "All clips must reference the same reel."
@@ -578,24 +641,21 @@ def get_source_name_from_timeline_clips(
     return source_name
 
 
-def get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+def _get_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
     source_name, settings
 ):
-    still_life_take_version_full_name_regex = settings[
-        "still_life_take_version_full_name_regex"
-    ]
-    match_ = re.search(still_life_take_version_full_name_regex, source_name)
+    match_ = re.search(settings["still_life_take_version_full_name_regex"], source_name)
     if match_:
-        return get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
-            match_.group(1), settings
+        return _get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+            _try_clean_take_version_full_name(source_name, settings), settings
         )
 
-    return get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+    return _get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
         source_name, settings
     )
 
 
-def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+def _get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
     take_version_full_name, settings
 ) -> Iterable[tuple[str, str, Path, float, tuple | None]]:
     bond_uri = settings["still_life_bond_uri"]
@@ -607,6 +667,10 @@ def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruple
     exposure_name_to_layer_type_mapping_items = settings[
         "still_life_exposure_name_to_layer_type_mapping"
     ]
+    print(
+        f"{bond_uri}/take_version_frame_relative_nuke_user_text_path"
+        f"/{production_name}/{take_version_full_name}/{image_render_type_name}"
+    )
     response = urlopen(
         f"{bond_uri}/take_version_frame_relative_nuke_user_text_path"
         f"/{production_name}/{take_version_full_name}/{image_render_type_name}"
@@ -642,7 +706,7 @@ def get_still_life_plate_name_prefix_layer_name_source_file_path_scale_quadruple
         yield "SM", layer_name, root_folder_path / frame_hashed_relative_path, 1, (1, 6)
 
 
-def get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
+def _get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
     source_name: str, settings
 ) -> Iterable[tuple[str, Path, float, tuple | None]]:
     reels_search_root_folder_path = Path(
@@ -662,7 +726,7 @@ def get_reel_plate_name_prefix_layer_name_source_file_path_scale_quadruplets(
     return (("LA", "BTY01", Path(reel_file_path_string), 0.5, None),)
 
 
-def create_nodes_for_layer(
+def _create_nodes_for_layer(
     variant_name,
     source_file_path,
     source_range,
@@ -762,3 +826,15 @@ def create_nodes_for_layer(
             input_frame_number,
         ) in frame_number_map.items():
             lookup_knob.setValueAt(input_frame_number, output_frame_number)
+
+
+def _try_clean_take_version_full_name(potential_take_version_full_name, settings):
+    potential_take_version_full_name = potential_take_version_full_name.strip()
+    match_ = re.search(
+        settings["still_life_take_version_full_name_regex"],
+        potential_take_version_full_name,
+    )
+    if not match_:
+        return potential_take_version_full_name
+
+    return "".join(match_.groups())
